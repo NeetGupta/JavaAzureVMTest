@@ -1,0 +1,159 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  maven_opts: "-Xmx2g"
+  jar_name: "spring-realtime-app-1.0.0.jar"
+  buildConfiguration: Release
+
+stages:
+
+# ----------------- BUILD -----------------
+- stage: Build
+  displayName: "Build & Unit Tests"
+  jobs:
+  - job: Build
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: UseJavaVersion@0
+      inputs:
+        versionSpec: '17'
+    - script: |
+        mvn -B -DskipTests=false clean test
+      displayName: "Run unit & integration tests"
+
+# ----------------- Static Analysis -----------------
+- stage: StaticAnalysis
+  displayName: "Static Analysis & Dependency Scan"
+  dependsOn: Build
+  jobs:
+  - job: StaticChecks
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        echo "Running SpotBugs"
+        mvn com.github.spotbugs:spotbugs-maven-plugin:4.7.0:check || true
+      displayName: "SpotBugs (non-blocking)"
+
+    - script: |
+        echo "Running OWASP Dependency-Check"
+        mvn org.owasp:dependency-check-maven:check -Dformats=ALL || true
+      displayName: "Dependency check (report)"
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'target/dependency-check-report'
+        artifactName: 'dependency-report'
+        publishLocation: 'Container'
+
+# ----------------- PACKAGE -----------------
+- stage: Package
+  displayName: "Package Artifact"
+  dependsOn: StaticAnalysis
+  jobs:
+  - job: Package
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        mvn -B -DskipTests=true package
+        cp target/*.jar $(Build.ArtifactStagingDirectory)/${{ variables.jar_name }}
+      displayName: "Package Jar"
+
+    - publish: $(Build.ArtifactStagingDirectory)
+      artifact: drop
+
+# ----------------- DEPLOY DEV -----------------
+- stage: Deploy_Dev
+  displayName: "Deploy to Dev VM"
+  dependsOn: Package
+  jobs:
+  - deployment: DeployDev
+    displayName: "Deploy to dev VM"
+    environment: 'dev.realtime' # environment in Azure DevOps
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+
+          # Copy artifact to VM (SSH service connection must be created in DevOps)
+          - task: CopyFilesOverSSH@0
+            inputs:
+              sshEndpoint: 'dev-vm-ssh'          # create in Project Settings -> Service connections
+              sourceFolder: '$(Pipeline.Workspace)/drop'
+              contents: '**/*'
+              targetFolder: '/tmp'
+
+          - task: SSH@0
+            inputs:
+              sshEndpoint: 'dev-vm-ssh'
+              runOptions: 'commands'
+              commands: |
+                sudo mv /tmp/${{ variables.jar_name }} /opt/myapp/${{ variables.jar_name }}
+                sudo chown ubuntu:ubuntu /opt/myapp/${{ variables.jar_name }}
+                sudo systemctl daemon-reload
+                sudo systemctl restart myapp
+                sudo systemctl status myapp --no-pager
+            displayName: "Restart app on dev VM"
+
+# ----------------- MANUAL APPROVAL -----------------
+- stage: ManualApproval
+  displayName: "Manual Approval Before PROD"
+  dependsOn: Deploy_Dev
+  jobs:
+  - job: WaitForApproval
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        notifyUsers: 'user@contoso.com'  # approver
+        instructions: 'Validate smoke tests in DEV. Approve to deploy to Production.'
+        timeout: '7' # hours
+
+# ----------------- DEPLOY PROD -----------------
+- stage: Deploy_Prod
+  displayName: "Deploy to Prod VM"
+  dependsOn: ManualApproval
+  jobs:
+  - deployment: DeployProd
+    environment: 'prod.realtime'
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+
+          - task: CopyFilesOverSSH@0
+            inputs:
+              sshEndpoint: 'prod-vm-ssh'
+              sourceFolder: '$(Pipeline.Workspace)/drop'
+              contents: '**/*'
+              targetFolder: '/tmp'
+
+          - task: SSH@0
+            inputs:
+              sshEndpoint: 'prod-vm-ssh'
+              runOptions: 'commands'
+              commands: |
+                # backup current jar
+                sudo cp /opt/myapp/${{ variables.jar_name }} /opt/myapp/${{ variables.jar_name }}.$(date +%s)
+                sudo mv /tmp/${{ variables.jar_name }} /opt/myapp/${{ variables.jar_name }}
+                sudo chown ubuntu:ubuntu /opt/myapp/${{ variables.jar_name }}
+                sudo systemctl daemon-reload
+                sudo systemctl restart myapp
+                # simple health check
+                sleep 5
+                curl -f http://127.0.0.1:8080/api/health || (echo "Health check failed"; exit 1)
+            displayName: "Deploy & health-check Prod"
